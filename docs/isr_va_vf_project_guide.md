@@ -158,10 +158,13 @@ isr-accelerate-lerobot \
   --output /home/jiongwei/dataset/force/plug_the_cord_into_outlet_0814_0820_short_355eposides_isr_va \
   --mode va \
   --target-retention 0.5 \
-  --max-skip 4
+  --max-skip 4 \
+  --gripper-change-tolerance 1e-4 \
+  --video-workers 4
 ```
 
 生成 VF 数据集：
+*需要先通过force_cali将raw-data的tactile-img变成tactile-state后再转成lerobotv2.1*
 
 ```bash
 isr-accelerate-lerobot \
@@ -170,10 +173,31 @@ isr-accelerate-lerobot \
   --mode vf \
   --target-retention 0.5 \
   --max-skip 4 \
-  --free-contact-seconds 1.0
+  --free-contact-seconds 1.0 \
+  --gripper-change-tolerance 1e-4 \
+  --video-workers 4
 ```
 
 输出目录必须尚不存在，且不能位于输入目录内部。程序先写入临时 staging 目录，全部 episode、视频和元数据成功后才将其重命名为最终输出；失败时不会修改输入数据。转换会重新编码全部视频，因此耗时主要取决于 episode 数量和视频流数量。
+
+转换性能与夹爪参数：
+
+- `--gripper-change-tolerance 1e-4`：只有相邻夹爪变化量大于该阈值时才强制保留变化两侧。该值可以过滤双臂数据中的 `1e-5` 量级抖动；设得过小会让连续微小变化占满保留预算，最终无法达到目标加速比。
+- `--video-workers 4`：同一 episode 内最多并行编码 4 路视频。每个任务写入独立相机文件；任一编码失败仍会终止转换并清理 staging。
+- 每完成一个 episode，程序会在 stderr 显示百分比、已用时间和 ETA；全部完成后，stdout 仍只输出 JSON 汇总。
+
+例如，将100条双臂插PCB数据转换为约2倍速 VA 数据：
+
+```bash
+isr-accelerate-lerobot \
+  --input /home/jiongwei/dataset/force/insert_pcb_0831_100episodes \
+  --output /home/jiongwei/dataset/force/insert_pcb_0831_100episodes_isr_va \
+  --mode va \
+  --target-retention 0.5 \
+  --max-skip 4 \
+  --gripper-change-tolerance 1e-4 \
+  --video-workers 4
+```
 
 转换完成后可检查：
 

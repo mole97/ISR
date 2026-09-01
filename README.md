@@ -153,7 +153,9 @@ isr-accelerate-lerobot \
   --output /path/to/source_lerobot_v21_isr_va \
   --mode va \
   --target-retention 0.5 \
-  --max-skip 4
+  --max-skip 4 \
+  --gripper-change-tolerance 1e-4 \
+  --video-workers 4
 ```
 
 Create the velocity/force-event (ISR–VF) dataset separately:
@@ -165,7 +167,9 @@ isr-accelerate-lerobot \
   --mode vf \
   --target-retention 0.5 \
   --max-skip 4 \
-  --free-contact-seconds 1.0
+  --free-contact-seconds 1.0 \
+  --gripper-change-tolerance 1e-4 \
+  --video-workers 4
 ```
 
 The input directory is never modified, and an existing output directory is
@@ -173,7 +177,10 @@ rejected. Every parquet signal and video stream uses the same selected source
 indices. The converter removes stale prioritized-sampling weights and records
 the source indices in `source_frame_index`. Recompute PI0.5 normalization
 statistics independently for each generated dataset; no PI0.5 model changes
-are required.
+are required. The gripper tolerance filters sub-threshold per-frame noise before
+forcing keyframes. Video streams are encoded concurrently, and episode progress
+with elapsed time and ETA is printed to stderr; the final JSON summary remains
+on stdout.
 
 ### 5.1 Compare original, VA, and VF videos
 

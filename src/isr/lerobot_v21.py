@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import dataclasses
 import json
@@ -10,17 +11,18 @@ import subprocess
 import tempfile
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .trajectory_acceleration import compute_va_priority
-from .trajectory_acceleration import compute_vf_priority
-from .trajectory_acceleration import find_gripper_change_indices
-from .trajectory_acceleration import select_isr_indices
-
+from .trajectory_acceleration import (
+    compute_va_priority,
+    compute_vf_priority,
+    find_gripper_change_indices,
+    select_isr_indices,
+)
 
 SAMPLING_WEIGHT_KEY = "sampling.speed_force_weight"
 SOURCE_FRAME_KEY = "source_frame_index"
@@ -123,12 +125,15 @@ def rewrite_info(
     mode: str,
     target_retention: float,
     max_skip: int,
+    gripper_change_tolerance: float = 1e-4,
 ) -> dict[str, Any]:
     """Return updated metadata without mutating the source dictionary."""
     if mode not in {"va", "vf"}:
         raise ValueError("mode must be 'va' or 'vf'")
     if total_frames < 1:
         raise ValueError("total_frames must be positive")
+    if not np.isfinite(gripper_change_tolerance) or gripper_change_tolerance < 0:
+        raise ValueError("gripper_change_tolerance must be finite and nonnegative")
     output = copy.deepcopy(info)
     output["total_frames"] = int(total_frames)
     features = output.setdefault("features", {})
@@ -140,6 +145,7 @@ def rewrite_info(
         "mode": mode,
         "target_retention": float(target_retention),
         "max_skip": int(max_skip),
+        "gripper_change_tolerance": float(gripper_change_tolerance),
         "source_frame_key": SOURCE_FRAME_KEY,
         "temporal_policy": "all parquet signals and video frames use identical selected source indices",
     }
@@ -217,6 +223,7 @@ def rewrite_video(
     selected_indices: np.ndarray,
     *,
     fps: float,
+    expected_source_frame_count: int | None = None,
 ) -> None:
     """Encode exactly the selected source frames on a new fixed-rate timeline."""
     selected = np.asarray(selected_indices, dtype=np.int64)
@@ -227,6 +234,14 @@ def rewrite_video(
     source_path = Path(source)
     destination_path = Path(destination)
     source_info = probe_video(source_path)
+    if (
+        expected_source_frame_count is not None
+        and source_info.frame_count != expected_source_frame_count
+    ):
+        raise ValueError(
+            f"source video has {source_info.frame_count} frames, "
+            f"expected {expected_source_frame_count}: {source_path}"
+        )
     if selected[-1] >= source_info.frame_count:
         raise ValueError(
             f"selected frame {selected[-1]} exceeds source video length {source_info.frame_count}"
@@ -328,6 +343,7 @@ def _episode_selection(
     target_retention: float,
     max_skip: int,
     free_contact_seconds: float,
+    gripper_change_tolerance: float = 1e-4,
 ) -> tuple[list[int], dict[str, Any]]:
     if "observation.state.eef_pose" not in table.column_names:
         raise ValueError("episode parquet is missing observation.state.eef_pose")
@@ -343,7 +359,12 @@ def _episode_selection(
         )
     else:
         raise ValueError("mode must be 'va' or 'vf'")
-    gripper_forced = find_gripper_change_indices(poses[:, 9::10])
+    if not np.isfinite(gripper_change_tolerance) or gripper_change_tolerance < 0:
+        raise ValueError("gripper_change_tolerance must be finite and nonnegative")
+    gripper_forced = find_gripper_change_indices(
+        poses[:, 9::10],
+        tolerance=gripper_change_tolerance,
+    )
     forced = np.unique(np.concatenate((signals.forced_indices, gripper_forced)))
     selected = select_isr_indices(
         signals.priority,
@@ -381,9 +402,14 @@ def convert_dataset(
     target_retention: float,
     max_skip: int,
     free_contact_seconds: float = 1.0,
+    gripper_change_tolerance: float = 1e-4,
+    video_workers: int = 1,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> ConversionSummary:
     """Create one accelerated LeRobot 2.1 dataset in a new sibling directory."""
     source, output = ensure_distinct_paths(input_root, output_root)
+    if isinstance(video_workers, bool) or not isinstance(video_workers, int) or video_workers < 1:
+        raise ValueError("video_workers must be a positive integer")
     if output.exists():
         raise FileExistsError(f"output dataset already exists: {output}")
     info_path = source / "meta/info.json"
@@ -442,6 +468,7 @@ def convert_dataset(
                 target_retention=target_retention,
                 max_skip=max_skip,
                 free_contact_seconds=free_contact_seconds,
+                gripper_change_tolerance=gripper_change_tolerance,
             )
             output_table = resample_episode_table(
                 source_table,
@@ -452,17 +479,31 @@ def convert_dataset(
             destination_data = staging / relative_data
             destination_data.parent.mkdir(parents=True, exist_ok=True)
             pq.write_table(output_table, destination_data, compression="zstd")
-            for video_key in video_keys:
-                relative_video = _format_dataset_path(
-                    video_template,
-                    episode_index=episode_index,
-                    chunks_size=chunks_size,
-                    video_key=video_key,
-                )
-                source_video = source / relative_video
-                if probe_video(source_video).frame_count != source_table.num_rows:
-                    raise ValueError(f"video/parquet frame mismatch: {source_video}")
-                rewrite_video(source_video, staging / relative_video, np.asarray(selected), fps=fps)
+            if video_keys:
+                selected_array = np.asarray(selected, dtype=np.int64)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(video_workers, len(video_keys))
+                ) as executor:
+                    futures = []
+                    for video_key in video_keys:
+                        relative_video = _format_dataset_path(
+                            video_template,
+                            episode_index=episode_index,
+                            chunks_size=chunks_size,
+                            video_key=video_key,
+                        )
+                        futures.append(
+                            executor.submit(
+                                rewrite_video,
+                                source / relative_video,
+                                staging / relative_video,
+                                selected_array,
+                                fps=fps,
+                                expected_source_frame_count=source_table.num_rows,
+                            )
+                        )
+                    for future in futures:
+                        future.result()
 
             total_source_frames += source_table.num_rows
             total_output_frames += output_table.num_rows
@@ -483,6 +524,8 @@ def convert_dataset(
                 }
             )
             manifests.append({"episode_index": episode_index, "mode": mode, **manifest})
+            if progress_callback is not None:
+                progress_callback(episode_index + 1, total_episodes)
 
         _write_jsonl(staging / "meta/episodes.jsonl", new_episode_records)
         _write_jsonl(staging / "meta/episodes_stats.jsonl", new_episode_stats)
@@ -493,6 +536,7 @@ def convert_dataset(
             mode=mode,
             target_retention=target_retention,
             max_skip=max_skip,
+            gripper_change_tolerance=gripper_change_tolerance,
         )
         output_info["trajectory_acceleration"].update(
             {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -91,6 +92,27 @@ def test_episode_selection_forces_gripper_changes_from_second_arm() -> None:
     assert {2, 3}.issubset(manifest["forced_source_indices"])
 
 
+def test_episode_selection_ignores_gripper_noise_below_tolerance() -> None:
+    gripper = [0.0, 5e-5, 0.0, 0.01, 0.01, 0.01]
+    poses = [
+        [float(index), 0, 0, 1, 0, 0, 0, 1, 0, gripper[index]]
+        for index in range(len(gripper))
+    ]
+    table = pa.table({"observation.state.eef_pose": _fixed_list(poses, 10)})
+
+    _, manifest = _episode_selection(
+        table,
+        mode="va",
+        fps=30.0,
+        target_retention=0.5,
+        max_skip=4,
+        free_contact_seconds=1.0,
+        gripper_change_tolerance=1e-4,
+    )
+
+    assert manifest["forced_source_indices"] == [2, 3]
+
+
 def test_resample_table_rebuilds_time_and_indices(tiny_table) -> None:
     output = resample_episode_table(tiny_table, np.asarray([0, 2, 4]), fps=20.0, global_start=7)
 
@@ -125,6 +147,7 @@ def test_rewrite_info_removes_stale_sampling_contract_and_adds_audit() -> None:
     assert "speed_force_sampling" not in output
     assert output["features"]["source_frame_index"] == {"dtype": "int64", "shape": [1], "names": None}
     assert output["trajectory_acceleration"]["mode"] == "vf"
+    assert output["trajectory_acceleration"]["gripper_change_tolerance"] == pytest.approx(1e-4)
     assert info["total_frames"] == 10
 
 
@@ -188,6 +211,25 @@ def test_convert_dataset_rejects_existing_output_before_writing(tmp_path: Path) 
     assert marker.read_text() == "untouched"
 
 
+@pytest.mark.parametrize("video_workers", [0, -1])
+def test_convert_dataset_rejects_nonpositive_video_workers(
+    tmp_path: Path,
+    video_workers: int,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+
+    with pytest.raises(ValueError, match="video_workers"):
+        convert_dataset(
+            source,
+            tmp_path / "output",
+            mode="va",
+            target_retention=0.5,
+            max_skip=4,
+            video_workers=video_workers,
+        )
+
+
 def test_rewrite_video_selects_exact_source_frames(tmp_path: Path) -> None:
     source = tmp_path / "source.mp4"
     destination = tmp_path / "output.mp4"
@@ -209,13 +251,34 @@ def test_rewrite_video_selects_exact_source_frames(tmp_path: Path) -> None:
         check=True,
     )
 
-    rewrite_video(source, destination, np.asarray([0, 2, 5]), fps=30.0)
+    rewrite_video(
+        source,
+        destination,
+        np.asarray([0, 2, 5]),
+        fps=30.0,
+        expected_source_frame_count=6,
+    )
 
     source_info = probe_video(source)
     output_info = probe_video(destination)
     assert source_info.frame_count == 6
     assert output_info.frame_count == 3
     assert output_info.fps == pytest.approx(30.0)
+
+
+def test_rewrite_video_rejects_unexpected_source_frame_count(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    destination = tmp_path / "output.mp4"
+    _write_test_video(source, frame_count=6)
+
+    with pytest.raises(ValueError, match="source video has 6 frames, expected 7"):
+        rewrite_video(
+            source,
+            destination,
+            np.asarray([0, 2, 5]),
+            fps=30.0,
+            expected_source_frame_count=7,
+        )
 
 
 def _write_test_video(path: Path, frame_count: int) -> None:
@@ -301,6 +364,55 @@ def _write_tiny_lerobot_dataset(root: Path, table) -> None:
     (root / "meta/episodes_stats.jsonl").write_text(json.dumps(source_stats) + "\n")
     for key in video_features:
         _write_test_video(root / f"videos/chunk-000/{key}/episode_000000.mp4", table.num_rows)
+
+
+def test_convert_dataset_encodes_videos_concurrently_and_reports_progress(
+    tmp_path: Path,
+    tiny_table,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "output"
+    _write_tiny_lerobot_dataset(source, tiny_table)
+    lock = threading.Lock()
+    encoders_started = threading.Barrier(2)
+    active = 0
+    maximum_active = 0
+    progress: list[tuple[int, int]] = []
+
+    def fake_rewrite_video(
+        source_path,
+        destination_path,
+        selected_indices,
+        *,
+        fps,
+        expected_source_frame_count,
+    ) -> None:
+        nonlocal active, maximum_active
+        assert expected_source_frame_count == tiny_table.num_rows
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        encoders_started.wait(timeout=2.0)
+        Path(destination_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(destination_path).touch()
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr("isr.lerobot_v21.rewrite_video", fake_rewrite_video)
+
+    convert_dataset(
+        source,
+        destination,
+        mode="va",
+        target_retention=0.6,
+        max_skip=2,
+        video_workers=2,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert maximum_active == 2
+    assert progress == [(1, 1)]
 
 
 @pytest.mark.parametrize("mode", ["va", "vf"])
