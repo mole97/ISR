@@ -137,6 +137,88 @@ For VLA/VA model fine-tuning in this work, the action targets are explicitly
 synchronized with the resampled state representation: the per-frame `actions`
 field is overwritten with the corresponding `states` field.
 
+## 5. Accelerate a LeRobot 2.1 dataset
+
+Install the optional dataset dependencies before running the offline converter:
+
+```bash
+pip install -e '.[lerobot]'
+```
+
+Create the velocity/acceleration (ISR–VA) ablation dataset:
+
+```bash
+isr-accelerate-lerobot \
+  --input /path/to/source_lerobot_v21 \
+  --output /path/to/source_lerobot_v21_isr_va \
+  --mode va \
+  --target-retention 0.5 \
+  --max-skip 4
+```
+
+Create the velocity/force-event (ISR–VF) dataset separately:
+
+```bash
+isr-accelerate-lerobot \
+  --input /path/to/source_lerobot_v21 \
+  --output /path/to/source_lerobot_v21_isr_vf \
+  --mode vf \
+  --target-retention 0.5 \
+  --max-skip 4 \
+  --free-contact-seconds 1.0
+```
+
+The input directory is never modified, and an existing output directory is
+rejected. Every parquet signal and video stream uses the same selected source
+indices. The converter removes stale prioritized-sampling weights and records
+the source indices in `source_frame_index`. Recompute PI0.5 normalization
+statistics independently for each generated dataset; no PI0.5 model changes
+are required.
+
+### 5.1 Compare original, VA, and VF videos
+
+Install the optional desktop viewer dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+See [README_viewer.md](README_viewer.md) for the complete Chinese guide,
+including the current dataset paths and troubleshooting notes.
+
+Launch an empty window, then drag an episode Parquet, episode MP4, or LeRobot
+dataset directory into it:
+
+```bash
+isr-compare-videos
+```
+
+Alternatively, open a specific episode directly:
+
+```bash
+isr-compare-videos \
+  --original-root /path/to/source_lerobot_v21 \
+  --va-root /path/to/source_lerobot_v21_isr_va \
+  --vf-root /path/to/source_lerobot_v21_isr_vf \
+  --episode 0 \
+  --camera observation.images.third_view
+```
+
+The camera selector switches all three panes together. **Source alignment**
+shows the nearest retained VA/VF frames for each original source frame, using
+`selection_manifest.jsonl`. **Native time** advances all videos at their own
+30 FPS frame index, so the shorter accelerated streams finish and freeze while
+the original continues. The window starts maximized and scales each video to
+its pane while preserving aspect ratio. Space toggles playback; the left and
+right arrow keys step one frame. Use `--ui-scale 3.0` if larger labels and
+controls are needed.
+
+The `Action comparison` tab reads `actions.eef_pose` or
+`actions.joint_position` directly from each episode Parquet. Compressed time
+shows the shorter accelerated sequence duration, while source time places VA
+and VF samples back at their recorded original frame positions.
+
 ## Acknowledgement
 
 The proposed ISR method is validated with

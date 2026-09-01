@@ -17,11 +17,23 @@ dependencies = [
 isr-resample   = "isr.cli.resample:main"
 isr-batch      = "isr.cli.batch:main"
 isr-visualize  = "isr.cli.visualize:main"
+isr-accelerate-lerobot = "isr.cli.accelerate_lerobot:main"
+isr-compare-videos = "isr.cli.compare_videos:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7",
     "ruff>=0.4",
+]
+lerobot = [
+    "pandas>=2",
+    "pyarrow>=14",
+]
+viewer = [
+    "opencv-python>=4.8",
+    "Pillow>=9",
+    "pyarrow>=14",
+    "tkinterdnd2>=0.4",
 ]
 
 [tool.setuptools.packages.find]

@@ -1,0 +1,12 @@
+# Core ISR runtime
+numpy>=1.24,<3
+matplotlib>=3.6
+
+# LeRobot 2.1 offline conversion
+pandas>=2
+pyarrow>=14
+
+# Episode video comparison window
+opencv-python>=4.8
+Pillow>=9
+tkinterdnd2>=0.4
